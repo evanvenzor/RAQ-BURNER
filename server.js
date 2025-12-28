@@ -78,7 +78,14 @@ app.post("/webhook/shopify/order-paid", async (req, res) => {
 
     const order = req.body;
     const subtotal = parseFloat(order.subtotal_price || "0");
-    const currency = order.currency;
+    if (!Number.isFinite(subtotal)) return res.status(200).send("Skipping burn");
+
+    const currency = (order.currency || "").toUpperCase().trim();
+
+    if (!order.id) {
+  console.log("Skipping burn: test webhook");
+  return res.status(200).send("Skipping test webhook");
+}
 
     console.log(`Order #${order.id} → $${subtotal} ${currency}`);
 
