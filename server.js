@@ -89,6 +89,15 @@ app.post("/webhook/shopify/order-paid", async (req, res) => {
     const burnAmountWei = ethers.parseUnits(burnAmount.toString(), TOKEN_DECIMALS);
 
     console.log(`🔥 Burning ${burnAmount} RAQ...`);
+    const treasury = await wallet.getAddress();
+const bal = await raq.balanceOf(treasury);
+console.log(`Treasury RAQ balance: ${ethers.formatUnits(bal, TOKEN_DECIMALS)} RAQ`);
+
+if (bal < burnAmountWei) {
+  console.log("Skipping burn: insufficient RAQ balance");
+  return res.status(200).send("Skipping burn (insufficient balance)");
+}
+
 
     const tx = await raq.transfer(BURN_ADDRESS, burnAmountWei);
 
