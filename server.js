@@ -18,7 +18,7 @@ const BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD";
 const TOKEN_DECIMALS = 18;
 
 // === Burn Formula ===
-const RAQ_PER_DOLLAR = 100; // $1 → 100 RAQ burned
+const RAQ_PER_DOLLAR = 10; // $1 → 10 RAQ burned
 
 // === Raw body for HMAC validation ===
 app.use((req, res, next) => {
