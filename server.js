@@ -6,6 +6,8 @@ const crypto = require("crypto");
 const { ethers } = require("ethers");
 
 const app = express();
+app.set("trust proxy", true);
+
 app.use((req, res, next) => {
   console.log(`[INCOMING ${new Date().toISOString()}] ${req.ip} ${req.method} ${req.originalUrl}`);
   next();
