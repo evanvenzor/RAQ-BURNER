@@ -59,11 +59,12 @@ function verifyHmac(req) {
 }
 
 // === Blockchain Wallet ===
-const provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
-const wallet = new ethers.Wallet(TREASURY_PRIVATE_KEY, provider);
 const raq = new ethers.Contract(
   RAQ_TOKEN_ADDRESS,
-  ["function transfer(address to, uint256 amount) public returns (bool)"],
+  [
+    "function transfer(address to, uint256 amount) public returns (bool)",
+    "function balanceOf(address owner) view returns (uint256)"
+  ],
   wallet
 );
 
