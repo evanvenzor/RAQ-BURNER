@@ -6,6 +6,10 @@ const crypto = require("crypto");
 const { ethers } = require("ethers");
 
 const app = express();
+app.use((req, res, next) => {
+  console.log(`[INCOMING ${new Date().toISOString()}] ${req.ip} ${req.method} ${req.originalUrl}`);
+  next();
+});
 
 // === CONFIG (env variables you will set in Render) ===
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
