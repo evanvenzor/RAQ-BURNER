@@ -1,0 +1,17 @@
+{
+  "name": "raq-burner",
+  "version": "1.0.0",
+  "description": "Automated RAQ token burn webhook service for Shopify",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ethers": "^6.9.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
