@@ -78,6 +78,26 @@ app.post("/webhook/shopify/order-paid", async (req, res) => {
     if (!verifyHmac(req)) return res.status(401).send("Invalid signature");
 
     const order = req.body;
+    // Preserved on Base™ — never block Shopify
+try {
+  const resPreserve = await preserveOnBaseIfTagged(order);
+  if (resPreserve?.preserved && resPreserve?.txHash) {
+    console.log(
+      "Preserved on Base™ tx:",
+      resPreserve.txHash,
+      "order:",
+      order?.name
+    );
+  } else if (resPreserve?.preserved && resPreserve?.skipped) {
+    console.log(
+      "Preserved on Base™ skipped (already processed):",
+      order?.name
+    );
+  }
+} catch (e) {
+  console.error("Preserved on Base™ failed:", e?.message || e);
+}
+
     const subtotal = parseFloat(order.subtotal_price || "0");
     if (!Number.isFinite(subtotal)) return res.status(200).send("Skipping burn");
 
