@@ -1,6 +1,6 @@
-import fs from "fs";
-import path from "path";
-import { ethers } from "ethers";
+const fs = require("fs");
+const path = require("path");
+const { ethers } = require("ethers");
 
 const BASE_RPC_URL = process.env.BASE_RPC_URL || "https://mainnet.base.org";
 const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
@@ -14,8 +14,11 @@ const signer = new ethers.Wallet(PRIVATE_KEY, provider);
 const STORE_PATH = path.join(process.cwd(), "pob-processed-orders.json");
 
 function loadProcessed() {
-  try { return new Set(JSON.parse(fs.readFileSync(STORE_PATH, "utf8"))); }
-  catch { return new Set(); }
+  try {
+    return new Set(JSON.parse(fs.readFileSync(STORE_PATH, "utf8")));
+  } catch {
+    return new Set();
+  }
 }
 function saveProcessed(set) {
   fs.writeFileSync(STORE_PATH, JSON.stringify([...set], null, 2));
@@ -24,13 +27,13 @@ function saveProcessed(set) {
 function hasOrderTag(order, tag) {
   const tags = (order?.tags || "")
     .split(",")
-    .map(s => s.trim().toLowerCase());
+    .map((s) => s.trim().toLowerCase());
   return tags.includes(tag.toLowerCase());
 }
 
 function extractCollectionFromOrderTags(order) {
-  const tags = (order?.tags || "").split(",").map(s => s.trim());
-  const found = tags.find(t => t.toLowerCase().startsWith("pob-collection:"));
+  const tags = (order?.tags || "").split(",").map((s) => s.trim());
+  const found = tags.find((t) => t.toLowerCase().startsWith("pob-collection:"));
   return found ? found.split(":").slice(1).join(":").trim() : "";
 }
 
@@ -48,7 +51,7 @@ function buildRecord(order) {
     collection,
     crafted_on: new Date(craftedISO).toISOString().slice(0, 10),
     shopify_order_id: order?.id,
-    order_name: order?.name
+    order_name: order?.name,
   };
 }
 
@@ -68,7 +71,7 @@ async function writeToBase(record) {
   return tx.hash;
 }
 
-export async function preserveOnBaseIfTagged(order) {
+async function preserveOnBaseIfTagged(order) {
   if (!hasOrderTag(order, "preserved-on-base")) return { preserved: false };
 
   const processed = loadProcessed();
@@ -88,3 +91,5 @@ export async function preserveOnBaseIfTagged(order) {
 
   return { preserved: true, txHash, record };
 }
+
+module.exports = { preserveOnBaseIfTagged };
