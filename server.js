@@ -4,6 +4,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const { ethers } = require("ethers");
+const { preserveOnBaseIfTagged } = require("./preservedOnBase");
 
 const app = express();
 app.set("trust proxy", true);
