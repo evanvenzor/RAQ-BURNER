@@ -88,6 +88,57 @@ try {
       "order:",
       order?.name
     );
+    // --- Shopify Flow → Preserved on Base™ trigger (runs AFTER Flow tags order) ---
+const FLOW_SHARED_SECRET = process.env.FLOW_SHARED_SECRET;
+
+app.post(
+  "/flow/preserve-on-base",
+  express.json({ type: "*/*" }),
+  async (req, res) => {
+    try {
+      const secret = req.get("x-flow-secret");
+      if (!FLOW_SHARED_SECRET || secret !== FLOW_SHARED_SECRET) {
+        return res.status(401).send("Unauthorized");
+      }
+
+      // Flow may send { order: {...} } or the raw order
+      const order = req.body?.order || req.body;
+
+      console.log(
+        "🧬 Flow preserve trigger:",
+        order?.name,
+        "tags:",
+        order?.tags
+      );
+
+      const result = await preserveOnBaseIfTagged(order);
+
+      if (result?.preserved && result?.txHash) {
+        console.log(
+          "✅ Preserved on Base™ tx:",
+          result.txHash,
+          "order:",
+          order?.name
+        );
+      } else if (result?.preserved && result?.skipped) {
+        console.log(
+          "ℹ️ Preserved on Base™ skipped (already processed):",
+          order?.name
+        );
+      } else {
+        console.log(
+          "ℹ️ Preserved on Base™ not requested for:",
+          order?.name
+        );
+      }
+
+      return res.status(200).send("ok");
+    } catch (e) {
+      console.error("❌ Flow preserve failed:", e?.message || e);
+      return res.status(200).send("ok"); // never block Flow
+    }
+  }
+);
   } else if (resPreserve?.preserved && resPreserve?.skipped) {
     console.log(
       "Preserved on Base™ skipped (already processed):",
