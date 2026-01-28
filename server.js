@@ -1,11 +1,11 @@
 // server.js
 // RAQ Automated Burn Webhook Server for Shopify Orders
-// + Preserved on Base™ (15s delayed check to allow Shopify tags)
+// + Preserved on Base™ (title-token trigger)
 
 const express = require("express");
 const crypto = require("crypto");
 const { ethers } = require("ethers");
-const { preserveOnBaseIfTagged } = require("./preservedOnBase");
+const { preserveOnBaseIfTagged } = require("./preservedOnBase"); // we'll call it, but we won't rely on tags anymore
 
 const app = express();
 app.set("trust proxy", true);
@@ -34,10 +34,8 @@ const TOKEN_DECIMALS = 18;
 // === Burn Formula ===
 const RAQ_PER_DOLLAR = 10;
 
-// === Utility: sleep ===
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+// === PRESERVED ON BASE™ Title Token ===
+const PRESERVE_TOKEN = "⟡ Preserved_on_Base ⟡";
 
 // === Verify Shopify Webhook HMAC ===
 function verifyHmacFromRaw(rawBody, hmacHeader) {
@@ -49,13 +47,19 @@ function verifyHmacFromRaw(rawBody, hmacHeader) {
     .digest("base64");
 
   try {
-    return crypto.timingSafeEqual(
-      Buffer.from(digest),
-      Buffer.from(hmacHeader)
-    );
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
   } catch {
     return false;
   }
+}
+
+// === Detect preserve request by token in any line item title ===
+function isPreserveRequestedByTitleToken(order) {
+  const items = Array.isArray(order?.line_items) ? order.line_items : [];
+  return items.some((li) => {
+    const title = (li?.title || "").toString();
+    return title.includes(PRESERVE_TOKEN);
+  });
 }
 
 // === Blockchain Wallet ===
@@ -133,13 +137,35 @@ app.post(
       }
 
       // ====================================================
-      // ⏳ PRESERVED ON BASE™ — DELAYED 15 SECONDS
+      // 🧬 PRESERVED ON BASE™ — TITLE TOKEN TRIGGER (NEW)
       // ====================================================
       (async () => {
         try {
-          await sleep(15_000);
+          const requested = isPreserveRequestedByTitleToken(order);
 
-          const result = await preserveOnBaseIfTagged(order);
+          if (!requested) {
+            console.log("ℹ️ Preserve not requested:", order?.name);
+            return;
+          }
+
+          console.log("🧬 Preserve requested (token found):", order?.name);
+
+          /**
+           * We are intentionally NOT relying on Shopify tags anymore.
+           * We reuse your existing preservedOnBase module by temporarily
+           * injecting the tag it expects, so you don't have to refactor that file yet.
+           */
+          const clonedOrder = { ...order };
+          const existingTags = (clonedOrder.tags || "").toString().trim();
+          const tags = existingTags ? existingTags.split(",").map(t => t.trim()) : [];
+
+          if (!tags.includes("preserved-on-base")) {
+            tags.push("preserved-on-base");
+          }
+
+          clonedOrder.tags = tags.join(", ");
+
+          const result = await preserveOnBaseIfTagged(clonedOrder);
 
           if (result?.preserved && result?.txHash) {
             console.log(
@@ -149,21 +175,13 @@ app.post(
               order?.name
             );
           } else if (result?.preserved && result?.skipped) {
-            console.log(
-              "ℹ️ Preserved on Base™ skipped:",
-              order?.name
-            );
+            console.log("ℹ️ Preserved on Base™ skipped:", order?.name);
           } else {
-            console.log(
-              "ℹ️ Preserve not requested:",
-              order?.name
-            );
+            // If preservedOnBaseIfTagged returns "not requested", it means it still didn't see the tag internally
+            console.log("⚠️ Preserve requested, but module did not preserve:", order?.name);
           }
         } catch (e) {
-          console.error(
-            "❌ Preserved on Base™ delayed check failed:",
-            e?.message || e
-          );
+          console.error("❌ Preserved on Base™ check failed:", e?.message || e);
         }
       })();
 
@@ -183,5 +201,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log(`RAQ Burner Live @ PORT ${PORT}`)
 );
-
-
