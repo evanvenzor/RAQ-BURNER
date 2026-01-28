@@ -1,4 +1,6 @@
 // preservedOnBase.js
+// Preserved on Base™ — title-token trigger + safer nonce/fee handling on Base
+
 const fs = require("fs");
 const path = require("path");
 const { ethers } = require("ethers");
@@ -11,11 +13,10 @@ if (!PRIVATE_KEY) throw new Error("Missing TREASURY_PRIVATE_KEY env var");
 const provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
 const signer = new ethers.Wallet(PRIVATE_KEY, provider);
 
-// Prevent duplicates if Shopify retries the same webhook
-// NOTE: Render filesystem is ephemeral; /tmp is safest for runtime dedupe.
+// Render filesystem is ephemeral; /tmp is the safest place for runtime dedupe.
 const STORE_PATH = path.join("/tmp", "pob-processed-orders.json");
 
-// Title-token trigger (your “Where’s Waldo” marker)
+// Your “Where’s Waldo” marker token in product titles
 const PRESERVE_TOKEN = "⟡ Preserved_on_Base ⟡";
 
 function loadProcessed() {
@@ -25,6 +26,7 @@ function loadProcessed() {
     return new Set();
   }
 }
+
 function saveProcessed(set) {
   fs.writeFileSync(STORE_PATH, JSON.stringify([...set], null, 2));
 }
@@ -32,7 +34,7 @@ function saveProcessed(set) {
 function normalizeTags(tagString) {
   return String(tagString || "")
     .split(",")
-    .map(s => s.trim().toLowerCase())
+    .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
 }
 
@@ -45,8 +47,8 @@ function productHasTagFromLineItems(order, tag) {
   const wanted = String(tag).toLowerCase();
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
 
-  return items.some(li => {
-    // Usually empty in Shopify order webhooks; kept for compatibility
+  return items.some((li) => {
+    // Usually NOT present in Shopify order webhooks; kept for compatibility.
     const productTags = normalizeTags(li?.product?.tags);
     return productTags.includes(wanted);
   });
@@ -54,14 +56,12 @@ function productHasTagFromLineItems(order, tag) {
 
 function titleHasToken(order) {
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
-  return items.some(li => String(li?.title || "").includes(PRESERVE_TOKEN));
+  return items.some((li) => String(li?.title || "").includes(PRESERVE_TOKEN));
 }
 
-// ✅ Primary trigger:
-// - Title contains token: ⟡ Preserved_on_Base ⟡
-// Legacy triggers kept optionally:
-// - order tag exists: preserved-on-base
-// - OR line_items include product tags (rarely present)
+// ✅ Preserve decision:
+// Primary: title token
+// Legacy: order tag or embedded product tags (rare)
 function shouldPreserve(order) {
   if (titleHasToken(order)) return true;
   if (orderHasTag(order, "preserved-on-base")) return true;
@@ -70,8 +70,8 @@ function shouldPreserve(order) {
 }
 
 function extractCollectionFromOrderTags(order) {
-  const tags = (order?.tags || "").split(",").map(s => s.trim());
-  const found = tags.find(t => t.toLowerCase().startsWith("pob-collection:"));
+  const tags = (order?.tags || "").split(",").map((s) => s.trim());
+  const found = tags.find((t) => t.toLowerCase().startsWith("pob-collection:"));
   return found ? found.split(":").slice(1).join(":").trim() : "";
 }
 
@@ -89,7 +89,7 @@ function buildRecord(order) {
     collection,
     crafted_on: new Date(craftedISO).toISOString().slice(0, 10),
     shopify_order_id: order?.id,
-    order_name: order?.name,
+    order_name: order?.name
   };
 }
 
@@ -107,7 +107,42 @@ async function writeToBase(record) {
   const bytes = (data.length - 2) / 2;
   if (bytes > 1400) throw new Error(`Preserved record too large (${bytes} bytes)`);
 
-  const tx = await signer.sendTransaction({ to, value: 0n, data });
+  // --- Critical fixes for "replacement transaction underpriced" ---
+  // 1) Use the pending nonce (avoids colliding with a tx that is not mined yet)
+  const nonce = await signer.getNonce("pending");
+
+  // 2) Explicit EIP-1559 fees with a bump
+  const feeData = await provider.getFeeData();
+
+  // Fallbacks if provider returns nulls
+  const baseMaxPriority =
+    feeData.maxPriorityFeePerGas ?? ethers.parseUnits("0.001", "gwei");
+  const baseMaxFee =
+    feeData.maxFeePerGas ?? ethers.parseUnits("0.05", "gwei");
+
+  // +30% bump to reduce replacement-underpriced errors
+  const maxPriorityFeePerGas = (baseMaxPriority * 130n) / 100n;
+  const maxFeePerGas = (baseMaxFee * 130n) / 100n;
+
+  // 3) Estimate gas and add buffer
+  const estimated = await provider.estimateGas({
+    from: signer.address,
+    to,
+    data,
+    value: 0n
+  });
+  const gasLimit = (estimated * 120n) / 100n; // +20%
+
+  const tx = await signer.sendTransaction({
+    to,
+    value: 0n,
+    data,
+    nonce,
+    gasLimit,
+    maxFeePerGas,
+    maxPriorityFeePerGas
+  });
+
   return tx.hash;
 }
 
@@ -131,6 +166,9 @@ async function preserveOnBaseIfTagged(order) {
 
   return { preserved: true, txHash, record };
 }
+
+module.exports = { preserveOnBaseIfTagged };
+
 
 module.exports = { preserveOnBaseIfTagged };
 
