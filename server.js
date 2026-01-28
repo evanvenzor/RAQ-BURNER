@@ -5,7 +5,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const { ethers } = require("ethers");
-const { preserveOnBaseIfTagged } = require("./preservedOnBase"); // we'll call it, but we won't rely on tags anymore
+const { preserveOnBaseIfTagged } = require("./preservedOnBase");
 
 const app = express();
 app.set("trust proxy", true);
@@ -56,10 +56,7 @@ function verifyHmacFromRaw(rawBody, hmacHeader) {
 // === Detect preserve request by token in any line item title ===
 function isPreserveRequestedByTitleToken(order) {
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
-  return items.some((li) => {
-    const title = (li?.title || "").toString();
-    return title.includes(PRESERVE_TOKEN);
-  });
+  return items.some(li => String(li?.title || "").includes(PRESERVE_TOKEN));
 }
 
 // === Blockchain Wallet ===
@@ -74,6 +71,9 @@ const raq = new ethers.Contract(
   ],
   wallet
 );
+
+// In-flight guard to avoid double preserve if Shopify retries quickly
+const inflightPreserve = new Set();
 
 // ============================================================
 // SHOPIFY WEBHOOK → ORDER PAID
@@ -102,86 +102,77 @@ app.post(
         return res.status(200).send("ok");
       }
 
+      const orderLabel = order?.name || `#${order.id}`;
+
       // ====================================================
       // 🔥 RAQ BURN — RUNS IMMEDIATELY (UNCHANGED)
       // ====================================================
       const subtotal = parseFloat(order.subtotal_price || "0");
       const currency = (order.currency || "").toUpperCase().trim();
 
-      console.log(`Order #${order.id} → $${subtotal} ${currency}`);
+      console.log(`Order ${orderLabel} → $${subtotal} ${currency}`);
 
-      if (!Number.isFinite(subtotal) || subtotal <= 0 || currency !== "USD") {
-        return res.status(200).send("Skipping burn");
-      }
+      // Burn is conditional, but we DO NOT return early anymore.
+      if (Number.isFinite(subtotal) && subtotal > 0 && currency === "USD") {
+        const burnAmount = subtotal * RAQ_PER_DOLLAR;
+        const burnAmountWei = ethers.parseUnits(
+          burnAmount.toString(),
+          TOKEN_DECIMALS
+        );
 
-      const burnAmount = subtotal * RAQ_PER_DOLLAR;
-      const burnAmountWei = ethers.parseUnits(
-        burnAmount.toString(),
-        TOKEN_DECIMALS
-      );
+        console.log(`🔥 Burning ${burnAmount} RAQ...`);
 
-      console.log(`🔥 Burning ${burnAmount} RAQ...`);
+        const treasury = await wallet.getAddress();
+        const bal = await raq.balanceOf(treasury);
 
-      const treasury = await wallet.getAddress();
-      const bal = await raq.balanceOf(treasury);
+        console.log(
+          `Treasury RAQ balance: ${ethers.formatUnits(bal, TOKEN_DECIMALS)} RAQ`
+        );
 
-      console.log(
-        `Treasury RAQ balance: ${ethers.formatUnits(bal, TOKEN_DECIMALS)} RAQ`
-      );
-
-      if (bal >= burnAmountWei) {
-        const tx = await raq.transfer(BURN_ADDRESS, burnAmountWei);
-        console.log(`✔ Burn TX: ${tx.hash}`);
+        if (bal >= burnAmountWei) {
+          const tx = await raq.transfer(BURN_ADDRESS, burnAmountWei);
+          console.log(`✔ Burn TX: ${tx.hash}`);
+        } else {
+          console.log("Skipping burn: insufficient RAQ balance");
+        }
       } else {
-        console.log("Skipping burn: insufficient RAQ balance");
+        console.log("Skipping burn: invalid subtotal or non-USD currency");
       }
 
       // ====================================================
-      // 🧬 PRESERVED ON BASE™ — TITLE TOKEN TRIGGER (NEW)
+      // 🧬 PRESERVED ON BASE™ — TITLE TOKEN TRIGGER
       // ====================================================
       (async () => {
         try {
           const requested = isPreserveRequestedByTitleToken(order);
 
           if (!requested) {
-            console.log("ℹ️ Preserve not requested:", order?.name);
+            console.log("ℹ️ Preserve not requested:", orderLabel);
             return;
           }
 
-          console.log("🧬 Preserve requested (token found):", order?.name);
-
-          /**
-           * We are intentionally NOT relying on Shopify tags anymore.
-           * We reuse your existing preservedOnBase module by temporarily
-           * injecting the tag it expects, so you don't have to refactor that file yet.
-           */
-          const clonedOrder = { ...order };
-          const existingTags = (clonedOrder.tags || "").toString().trim();
-          const tags = existingTags ? existingTags.split(",").map(t => t.trim()) : [];
-
-          if (!tags.includes("preserved-on-base")) {
-            tags.push("preserved-on-base");
+          if (inflightPreserve.has(String(order.id))) {
+            console.log("ℹ️ Preserve already in-flight:", orderLabel);
+            return;
           }
 
-          clonedOrder.tags = tags.join(", ");
+          inflightPreserve.add(String(order.id));
+          console.log("🧬 Preserve requested (token found):", orderLabel);
 
-          const result = await preserveOnBaseIfTagged(clonedOrder);
+          // NOTE: This assumes preservedOnBase.js also supports the token trigger.
+          const result = await preserveOnBaseIfTagged(order);
 
           if (result?.preserved && result?.txHash) {
-            console.log(
-              "🧬 Preserved on Base™ tx:",
-              result.txHash,
-              "order:",
-              order?.name
-            );
+            console.log("🧬 Preserved on Base™ tx:", result.txHash, "order:", orderLabel);
           } else if (result?.preserved && result?.skipped) {
-            console.log("ℹ️ Preserved on Base™ skipped:", order?.name);
+            console.log("ℹ️ Preserved on Base™ skipped:", orderLabel);
           } else {
-            // If preservedOnBaseIfTagged returns "not requested", it means it still didn't see the tag internally
-            console.log("⚠️ Preserve requested, but module did not preserve:", order?.name);
+            console.log("⚠️ Preserve requested, but not preserved:", orderLabel);
           }
         } catch (e) {
-          console.error("❌ Preserved on Base™ check failed:", e?.message || e);
+          console.error("❌ Preserved on Base™ failed:", e?.message || e);
+        } finally {
+          inflightPreserve.delete(String(order.id));
         }
       })();
 
@@ -198,6 +189,5 @@ app.get("/", (req, res) => res.status(200).send("ok"));
 
 // === Start Server ===
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`RAQ Burner Live @ PORT ${PORT}`)
-);
+app.listen(PORT, () => console.log(`RAQ Burner Live @ PORT ${PORT}`));
+
