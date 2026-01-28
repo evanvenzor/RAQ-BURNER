@@ -12,7 +12,11 @@ const provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
 const signer = new ethers.Wallet(PRIVATE_KEY, provider);
 
 // Prevent duplicates if Shopify retries the same webhook
-const STORE_PATH = path.join(process.cwd(), "pob-processed-orders.json");
+// NOTE: Render filesystem is ephemeral; /tmp is safest for runtime dedupe.
+const STORE_PATH = path.join("/tmp", "pob-processed-orders.json");
+
+// Title-token trigger (your “Where’s Waldo” marker)
+const PRESERVE_TOKEN = "⟡ Preserved_on_Base ⟡";
 
 function loadProcessed() {
   try {
@@ -42,18 +46,24 @@ function productHasTagFromLineItems(order, tag) {
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
 
   return items.some(li => {
-    // Shopify webhooks usually include product_id + variant_id, NOT full product object.
-    // So this only works if you have the product tags embedded (some setups do),
-    // OR if you store the tag on the LINE ITEM properties (not typical).
+    // Usually empty in Shopify order webhooks; kept for compatibility
     const productTags = normalizeTags(li?.product?.tags);
     return productTags.includes(wanted);
   });
 }
 
+function titleHasToken(order) {
+  const items = Array.isArray(order?.line_items) ? order.line_items : [];
+  return items.some(li => String(li?.title || "").includes(PRESERVE_TOKEN));
+}
+
 // ✅ Primary trigger:
-// - If order tag exists: preserved-on-base
-// - OR if line_items include product tags (when present in payload)
+// - Title contains token: ⟡ Preserved_on_Base ⟡
+// Legacy triggers kept optionally:
+// - order tag exists: preserved-on-base
+// - OR line_items include product tags (rarely present)
 function shouldPreserve(order) {
+  if (titleHasToken(order)) return true;
   if (orderHasTag(order, "preserved-on-base")) return true;
   if (productHasTagFromLineItems(order, "preserved-on-base")) return true;
   return false;
@@ -89,7 +99,9 @@ function toCalldata(record) {
 }
 
 async function writeToBase(record) {
-  const to = process.env.PRESERVED_RECORD_TO || signer.address;
+  const toEnv = (process.env.PRESERVED_RECORD_TO || "").trim();
+  const to = toEnv ? toEnv : signer.address;
+
   const data = toCalldata(record);
 
   const bytes = (data.length - 2) / 2;
@@ -122,6 +134,4 @@ async function preserveOnBaseIfTagged(order) {
 
 module.exports = { preserveOnBaseIfTagged };
 
-
-module.exports = { preserveOnBaseIfTagged };
 
