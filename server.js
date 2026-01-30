@@ -1,3 +1,13 @@
+process.on("uncaughtException", (err) => {
+  console.error("🔥 uncaughtException:", err);
+  process.exit(1);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("🔥 unhandledRejection:", err);
+  process.exit(1);
+});
+console.log("✅ server.js starting...");
+
 // server.js
 // RAQ Automated Burn Webhook Server for Shopify Orders
 // + Preserved on Base™ (title-token trigger)
