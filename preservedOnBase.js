@@ -1,222 +1,214 @@
-// preservedOnBase.js
-// Preserved on Base™ — title-token trigger + CONFIRMED finality (waits for block confirmation)
-//
-// Corrections included (for your nonce-used error + stability):
-// ✅ Uses CHAIN-TRUTH nonce ("latest") instead of "pending" to avoid `nonce has already been used`
-// ✅ Adds a simple in-process TX LOCK so two preserves can't race the nonce
-// ✅ Waits for confirmations (tx.wait) and only returns a FINALIZED tx hash
-// ✅ Keeps EIP-1559 fees + bump + gas estimate buffer
-// ✅ Uses /tmp for runtime dedupe on Render
-// ✅ Single module.exports
+// server.js
+// RAQ Automated Burn Webhook Server for Shopify Orders
+// + Preserved on Base™ (title-token trigger)
+// Key fixes:
+// - Verifies Shopify HMAC on RAW body
+// - Burn TX waits for 1 confirmation BEFORE preserve (prevents tx replacement/nonce fights)
+// - Preserve runs even if burn is skipped
+// - Proper template string logging
+// - In-flight guard to avoid duplicate preserve on quick Shopify retries
 
-const fs = require("fs");
-const path = require("path");
+const express = require("express");
+const crypto = require("crypto");
 const { ethers } = require("ethers");
+const { preserveOnBaseIfTagged } = require("./preservedOnBase");
 
+const app = express();
+app.set("trust proxy", true);
+
+app.use((req, res, next) => {
+  console.log(
+    `[INCOMING ${new Date().toISOString()}] ${req.ip} ${req.method} ${req.originalUrl}`
+  );
+  next();
+});
+
+// === CONFIG (Render env vars) ===
+const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
+const TREASURY_PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
+
+if (!TREASURY_PRIVATE_KEY) {
+  throw new Error("Missing TREASURY_PRIVATE_KEY env var");
+}
+
+// === RAQ Token Settings ===
 const BASE_RPC_URL = process.env.BASE_RPC_URL || "https://mainnet.base.org";
-const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
+const RAQ_TOKEN_ADDRESS = "0x80ab779f3071a9c6af4f0a5737e1f6aaa4da72eb";
+const BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD";
+const TOKEN_DECIMALS = 18;
 
-if (!PRIVATE_KEY) throw new Error("Missing TREASURY_PRIVATE_KEY env var");
+// === Burn Formula ===
+const RAQ_PER_DOLLAR = 10;
 
-const provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
-const signer = new ethers.Wallet(PRIVATE_KEY, provider);
-
-// Render filesystem is ephemeral; /tmp is safest for runtime dedupe.
-const STORE_PATH = path.join("/tmp", "pob-processed-orders.json");
-
-// Your “Where’s Waldo” marker token in product titles
+// === PRESERVED ON BASE™ Title Token ===
 const PRESERVE_TOKEN = "⟡ Preserved_on_Base ⟡";
 
-// How many confirmations before we call it "final"
-const CONFIRMATIONS = Number(process.env.POB_CONFIRMATIONS || "1");
+// === Verify Shopify Webhook HMAC ===
+function verifyHmacFromRaw(rawBody, hmacHeader) {
+  if (!SHOPIFY_WEBHOOK_SECRET || !hmacHeader) return false;
 
-// Optional: max time to wait for confirmation before failing (ms)
-const WAIT_TIMEOUT_MS = Number(process.env.POB_WAIT_TIMEOUT_MS || "180000"); // 3 minutes
+  const digest = crypto
+    .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
+    .update(rawBody, "utf8")
+    .digest("base64");
 
-function loadProcessed() {
   try {
-    return new Set(JSON.parse(fs.readFileSync(STORE_PATH, "utf8")));
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
   } catch {
-    return new Set();
+    return false;
   }
 }
 
-function saveProcessed(set) {
-  fs.writeFileSync(STORE_PATH, JSON.stringify([...set], null, 2));
-}
-
-function normalizeTags(tagString) {
-  return String(tagString || "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-}
-
-function orderHasTag(order, tag) {
-  const tags = normalizeTags(order?.tags);
-  return tags.includes(String(tag).toLowerCase());
-}
-
-function productHasTagFromLineItems(order, tag) {
-  const wanted = String(tag).toLowerCase();
-  const items = Array.isArray(order?.line_items) ? order.line_items : [];
-
-  return items.some((li) => {
-    // Usually NOT present in Shopify order webhooks; kept for compatibility.
-    const productTags = normalizeTags(li?.product?.tags);
-    return productTags.includes(wanted);
-  });
-}
-
-function titleHasToken(order) {
+// === Detect preserve request by token in any line item title ===
+function isPreserveRequestedByTitleToken(order) {
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
   return items.some((li) => String(li?.title || "").includes(PRESERVE_TOKEN));
 }
 
-// ✅ Preserve decision:
-// Primary: title token
-// Legacy: order tag or embedded product tags (rare)
-function shouldPreserve(order) {
-  if (titleHasToken(order)) return true;
-  if (orderHasTag(order, "preserved-on-base")) return true;
-  if (productHasTagFromLineItems(order, "preserved-on-base")) return true;
-  return false;
-}
+// === Blockchain Wallet ===
+const provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
+const wallet = new ethers.Wallet(TREASURY_PRIVATE_KEY, provider);
 
-function extractCollectionFromOrderTags(order) {
-  const tags = (order?.tags || "").split(",").map((s) => s.trim());
-  const found = tags.find((t) => t.toLowerCase().startsWith("pob-collection:"));
-  return found ? found.split(":").slice(1).join(":").trim() : "";
-}
+const raq = new ethers.Contract(
+  RAQ_TOKEN_ADDRESS,
+  [
+    "function transfer(address to, uint256 amount) public returns (bool)",
+    "function balanceOf(address owner) view returns (uint256)"
+  ],
+  wallet
+);
 
-function buildRecord(order) {
-  const craftedISO =
-    order?.processed_at ||
-    order?.paid_at ||
-    order?.created_at ||
-    new Date().toISOString();
+// In-flight guard to avoid double preserve if Shopify retries quickly
+const inflightPreserve = new Set();
 
-  const collection = extractCollectionFromOrderTags(order) || "Preserved Collection";
+// ============================================================
+// SHOPIFY WEBHOOK → ORDER PAID
+// ============================================================
+app.post(
+  "/webhook/shopify/order-paid",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    try {
+      const rawBody = req.body ? req.body.toString("utf8") : "";
+      const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
 
-  return {
-    mark: "Preserved on Base™",
-    collection,
-    crafted_on: new Date(craftedISO).toISOString().slice(0, 10),
-    shopify_order_id: order?.id,
-    order_name: order?.name
-  };
-}
+      if (!verifyHmacFromRaw(rawBody, hmacHeader)) {
+        return res.status(401).send("Invalid signature");
+      }
 
-function toCalldata(record) {
-  const payload = "POB1:" + JSON.stringify(record);
-  return ethers.hexlify(ethers.toUtf8Bytes(payload));
-}
+      let order;
+      try {
+        order = JSON.parse(rawBody);
+      } catch {
+        order = {};
+      }
 
-function withTimeout(promise, ms, label = "operation") {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
-    )
-  ]);
-}
+      if (!order?.id) {
+        console.log("Skipping: test webhook or missing order.id");
+        return res.status(200).send("ok");
+      }
 
-// ----------------------------------------------------------------------------
-// TX LOCK: ensures only one preservation tx is constructed/sent at a time.
-// This prevents nonce races when webhooks retry or two requests overlap.
-// ----------------------------------------------------------------------------
-let txLock = Promise.resolve();
-function runWithTxLock(fn) {
-  txLock = txLock.then(fn, fn);
-  return txLock;
-}
+      const orderLabel = order?.name || `#${order.id}`;
+      const idKey = String(order.id);
 
-async function writeToBase(record) {
-  return runWithTxLock(async () => {
-    const toEnv = (process.env.PRESERVED_RECORD_TO || "").trim();
-    const to = toEnv ? toEnv : signer.address;
+      // ====================================================
+      // 🔥 RAQ BURN — CONFIRM BEFORE PRESERVE
+      // ====================================================
+      const subtotal = parseFloat(order.subtotal_price || "0");
+      const currency = (order.currency || "").toUpperCase().trim();
 
-    const data = toCalldata(record);
+      console.log(`Order ${orderLabel} → $${subtotal} ${currency}`);
 
-    const bytes = (data.length - 2) / 2;
-    if (bytes > 1400) throw new Error(`Preserved record too large (${bytes} bytes)`);
+      if (Number.isFinite(subtotal) && subtotal > 0 && currency === "USD") {
+        const burnAmount = subtotal * RAQ_PER_DOLLAR;
+        const burnAmountWei = ethers.parseUnits(
+          burnAmount.toString(),
+          TOKEN_DECIMALS
+        );
 
-    // ✅ Nonce source of truth:
-    // Use "latest" mined nonce to avoid `nonce has already been used` errors
-    // that can happen with "pending" across different RPC mempools.
-    const nonce = await signer.getNonce("pending");
+        console.log(`🔥 Burning ${burnAmount} RAQ...`);
 
-    // Fee data (EIP-1559)
-    const feeData = await provider.getFeeData();
+        const treasury = await wallet.getAddress();
+        const bal = await raq.balanceOf(treasury);
 
-    // If provider returns nulls, use sane fallbacks.
-    // Slightly higher fallbacks help Base tx inclusion.
-    const baseMaxPriority =
-      feeData.maxPriorityFeePerGas ?? ethers.parseUnits("0.002", "gwei");
-    const baseMaxFee =
-      feeData.maxFeePerGas ?? ethers.parseUnits("0.08", "gwei");
+        console.log(
+          `Treasury RAQ balance: ${ethers.formatUnits(bal, TOKEN_DECIMALS)} RAQ`
+        );
 
-    // Aggressive bump to reduce replacement/underpriced issues
-    const maxPriorityFeePerGas = (baseMaxPriority * 180n) / 100n; // +80%
-    const maxFeePerGas = (baseMaxFee * 180n) / 100n;             // +80%
+        if (bal >= burnAmountWei) {
+          try {
+            const tx = await raq.transfer(BURN_ADDRESS, burnAmountWei);
+            console.log(`✔ Burn TX (broadcast): ${tx.hash}`);
 
-    // Estimate gas + buffer
-    const estimated = await provider.estimateGas({
-      from: signer.address,
-      to,
-      data,
-      value: 0n
-    });
-    const gasLimit = (estimated * 130n) / 100n; // +30%
+            const receipt = await tx.wait(1); // wait for 1 confirmation
+            if (!receipt || receipt.status !== 1) {
+              console.log("⚠️ Burn tx failed or was reverted");
+            } else {
+              console.log(`✔ Burn TX (confirmed): ${receipt.transactionHash}`);
+            }
+          } catch (e) {
+            console.error("❌ Burn tx failed:", e?.message || e);
+          }
+        } else {
+          console.log("Skipping burn: insufficient RAQ balance");
+        }
+      } else {
+        console.log("Skipping burn: invalid subtotal or non-USD currency");
+      }
 
-    // Send transaction
-    const tx = await signer.sendTransaction({
-      to,
-      value: 0n,
-      data,
-      nonce,
-      gasLimit,
-      maxFeePerGas,
-      maxPriorityFeePerGas
-    });
+      // ====================================================
+      // 🧬 PRESERVED ON BASE™ — TITLE TOKEN TRIGGER
+      // ====================================================
+      (async () => {
+        try {
+          const requested = isPreserveRequestedByTitleToken(order);
 
-    // Wait for confirmations (finality)
-    const receipt = await withTimeout(
-      tx.wait(CONFIRMATIONS),
-      WAIT_TIMEOUT_MS,
-      "tx confirmation"
-    );
+          if (!requested) {
+            console.log("ℹ️ Preserve not requested:", orderLabel);
+            return;
+          }
 
-    if (!receipt || receipt.status !== 1) {
-      throw new Error("Preserve transaction failed or was reverted");
+          if (inflightPreserve.has(idKey)) {
+            console.log("ℹ️ Preserve already in-flight:", orderLabel);
+            return;
+          }
+
+          inflightPreserve.add(idKey);
+          console.log("🧬 Preserve requested (token found):", orderLabel);
+
+          const result = await preserveOnBaseIfTagged(order);
+
+          if (result?.preserved && result?.txHash) {
+            console.log(
+              "🧬 Preserved on Base™ tx:",
+              result.txHash,
+              "order:",
+              orderLabel
+            );
+          } else if (result?.preserved && result?.skipped) {
+            console.log("ℹ️ Preserved on Base™ skipped:", orderLabel);
+          } else {
+            console.log("⚠️ Preserve requested, but not preserved:", orderLabel);
+          }
+        } catch (e) {
+          console.error("❌ Preserved on Base™ failed:", e?.message || e);
+        } finally {
+          inflightPreserve.delete(idKey);
+        }
+      })();
+
+      return res.status(200).send("ok");
+    } catch (err) {
+      console.error("Webhook Error:", err?.message || err);
+      return res.status(500).send("Error");
     }
-
-    return receipt.transactionHash;
-  });
-}
-
-async function preserveOnBaseIfTagged(order) {
-  if (!shouldPreserve(order)) return { preserved: false };
-
-  const processed = loadProcessed();
-  const key = String(order?.id || "");
-
-  // If we already finalized this order, skip (prevents double-preserve on retries)
-  if (key && processed.has(key)) {
-    return { preserved: true, skipped: true };
   }
+);
 
-  const record = buildRecord(order);
+// === Health check ===
+app.get("/", (req, res) => res.status(200).send("ok"));
 
-  // Only store as processed AFTER we have a CONFIRMED tx hash
-  const txHash = await writeToBase(record);
+// === Start Server ===
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`RAQ Burner Live @ PORT ${PORT}`));
 
-  if (key) {
-    processed.add(key);
-    saveProcessed(processed);
-  }
-
-  return { preserved: true, txHash, record };
-}
-
-module.exports = { preserveOnBaseIfTagged };
