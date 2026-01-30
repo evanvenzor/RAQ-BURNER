@@ -1,224 +1,210 @@
 // preservedOnBase.js
-// Preserved on Base™ — title-token trigger + CONFIRMED finality (waits for block confirmation)
-//
-// Corrections included (for your nonce-used error + stability):
-// ✅ Uses CHAIN-TRUTH nonce ("latest") instead of "pending" to avoid `nonce has already been used`
-// ✅ Adds a simple in-process TX LOCK so two preserves can't race the nonce
-// ✅ Waits for confirmations (tx.wait) and only returns a FINALIZED tx hash
-// ✅ Keeps EIP-1559 fees + bump + gas estimate buffer
-// ✅ Uses /tmp for runtime dedupe on Render
-// ✅ Single module.exports
+// Preserved on Base™ helper for RAQ-BURNER (CommonJS)
+// Creates an immutable onchain "proof" as a 0 ETH self-tx with calldata that contains a hash of the order.
+// Exports: preserveOnBaseIfTagged(order)
 
-const fs = require("fs");
-const path = require("path");
 const { ethers } = require("ethers");
 
+// ---- Env / defaults ----
 const BASE_RPC_URL = process.env.BASE_RPC_URL || "https://mainnet.base.org";
-const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
+const TREASURY_PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
 
-if (!PRIVATE_KEY) throw new Error("Missing TREASURY_PRIVATE_KEY env var");
+// Optional: delay preserve to reduce nonce/tx replacement fights (default 15s)
+const PRESERVE_DELAY_MS = Number(process.env.PRESERVE_DELAY_MS || 15000);
 
-const provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
-const signer = new ethers.Wallet(PRIVATE_KEY, provider);
+// Optional: allow turning preserve off quickly without redeploy
+const PRESERVE_DISABLED = String(process.env.PRESERVE_DISABLED || "").toLowerCase() === "true";
 
-// Render filesystem is ephemeral; /tmp is safest for runtime dedupe.
-const STORE_PATH = path.join("/tmp", "pob-processed-orders.json");
-
-// Your “Where’s Waldo” marker token in product titles
+// Token string that indicates preserve was requested via line-item title
 const PRESERVE_TOKEN = "⟡ Preserved_on_Base ⟡";
 
-// How many confirmations before we call it "final"
-const CONFIRMATIONS = Number(process.env.POB_CONFIRMATIONS || "1");
-
-// Optional: max time to wait for confirmation before failing (ms)
-const WAIT_TIMEOUT_MS = Number(process.env.POB_WAIT_TIMEOUT_MS || "180000"); // 3 minutes
-
-function loadProcessed() {
-  try {
-    return new Set(JSON.parse(fs.readFileSync(STORE_PATH, "utf8")));
-  } catch {
-    return new Set();
-  }
+if (!TREASURY_PRIVATE_KEY) {
+  // Don't hard-throw here unless you want deploy to fail when preserve is unused.
+  // server.js already throws if missing.
+  console.warn("⚠️ TREASURY_PRIVATE_KEY missing in preservedOnBase.js");
 }
 
-function saveProcessed(set) {
-  fs.writeFileSync(STORE_PATH, JSON.stringify([...set], null, 2));
+const provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
+const wallet = new ethers.Wallet(TREASURY_PRIVATE_KEY, provider);
+
+// ---- Helpers ----
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function normalizeTags(tagString) {
-  return String(tagString || "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-}
-
-function orderHasTag(order, tag) {
-  const tags = normalizeTags(order?.tags);
-  return tags.includes(String(tag).toLowerCase());
-}
-
-function productHasTagFromLineItems(order, tag) {
-  const wanted = String(tag).toLowerCase();
-  const items = Array.isArray(order?.line_items) ? order.line_items : [];
-
-  return items.some((li) => {
-    // Usually NOT present in Shopify order webhooks; kept for compatibility.
-    const productTags = normalizeTags(li?.product?.tags);
-    return productTags.includes(wanted);
-  });
-}
-
-function titleHasToken(order) {
+function preserveRequested(order) {
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
   return items.some((li) => String(li?.title || "").includes(PRESERVE_TOKEN));
 }
 
-// ✅ Preserve decision:
-// Primary: title token
-// Legacy: order tag or embedded product tags (rare)
-function shouldPreserve(order) {
-  if (titleHasToken(order)) return true;
-  if (orderHasTag(order, "preserved-on-base")) return true;
-  if (productHasTagFromLineItems(order, "preserved-on-base")) return true;
-  return false;
-}
+/**
+ * Build a minimal, stable record to hash.
+ * Keep it small (avoid storing raw PII onchain).
+ */
+function buildCanonicalRecord(order) {
+  const lineItems = (Array.isArray(order?.line_items) ? order.line_items : []).map((li) => ({
+    title: String(li?.title || ""),
+    quantity: Number(li?.quantity || 0),
+    price: String(li?.price || ""),
+  }));
 
-function extractCollectionFromOrderTags(order) {
-  const tags = (order?.tags || "").split(",").map((s) => s.trim());
-  const found = tags.find((t) => t.toLowerCase().startsWith("pob-collection:"));
-  return found ? found.split(":").slice(1).join(":").trim() : "";
-}
-
-function buildRecord(order) {
-  const craftedISO =
-    order?.processed_at ||
-    order?.paid_at ||
-    order?.created_at ||
-    new Date().toISOString();
-
-  const collection = extractCollectionFromOrderTags(order) || "Preserved Collection";
+  // Avoid putting email/address directly onchain — if you *need* them, hash them first.
+  const customerEmail = String(order?.email || order?.customer?.email || "");
+  const emailHash = customerEmail
+    ? ethers.keccak256(ethers.toUtf8Bytes(customerEmail.trim().toLowerCase()))
+    : null;
 
   return {
-    mark: "Preserved on Base™",
-    collection,
-    crafted_on: new Date(craftedISO).toISOString().slice(0, 10),
-    shopify_order_id: order?.id,
-    order_name: order?.name
+    v: 1,
+    type: "PRESERVED_ON_BASE",
+    order_id: String(order?.id || ""),
+    order_name: String(order?.name || ""),
+    created_at: String(order?.created_at || ""),
+    currency: String(order?.currency || ""),
+    subtotal: String(order?.subtotal_price || ""),
+    total: String(order?.total_price || ""),
+    email_hash: emailHash, // hashed only
+    line_items: lineItems,
   };
 }
 
-function toCalldata(record) {
-  const payload = "POB1:" + JSON.stringify(record);
-  return ethers.hexlify(ethers.toUtf8Bytes(payload));
+/**
+ * Create calldata: "POB1" + 32-byte keccak256 hash
+ * Small, cheap, and deterministic.
+ */
+function buildProofCalldata(order) {
+  const record = buildCanonicalRecord(order);
+  const canonical = JSON.stringify(record);
+  const digestHex = ethers.keccak256(ethers.toUtf8Bytes(canonical)); // 0x + 32 bytes
+
+  const prefix = ethers.toUtf8Bytes("POB1"); // 4 bytes
+  const digestBytes = ethers.getBytes(digestHex); // 32 bytes
+
+  const dataBytes = ethers.concat([prefix, digestBytes]); // 36 bytes total
+  const dataHex = ethers.hexlify(dataBytes);
+
+  return { digestHex, dataHex, canonicalSize: canonical.length };
 }
 
-function withTimeout(promise, ms, label = "operation") {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
-    )
-  ]);
+async function getFeeOverrides() {
+  const fee = await provider.getFeeData();
+  // Base is EIP-1559; these fields are usually present.
+  // If not, fallback to legacy gasPrice.
+  const overrides = {};
+
+  if (fee.maxFeePerGas && fee.maxPriorityFeePerGas) {
+    // Give it a small bump to reduce replacement/cancel odds
+    // (still reasonable for Base)
+    overrides.maxFeePerGas = fee.maxFeePerGas + fee.maxFeePerGas / 10n; // +10%
+    overrides.maxPriorityFeePerGas =
+      fee.maxPriorityFeePerGas + fee.maxPriorityFeePerGas / 5n; // +20%
+  } else if (fee.gasPrice) {
+    overrides.gasPrice = fee.gasPrice + fee.gasPrice / 10n; // +10%
+  }
+
+  return overrides;
 }
 
-// ----------------------------------------------------------------------------
-// TX LOCK: ensures only one preservation tx is constructed/sent at a time.
-// This prevents nonce races when webhooks retry or two requests overlap.
-// ----------------------------------------------------------------------------
-let txLock = Promise.resolve();
-function runWithTxLock(fn) {
-  txLock = txLock.then(fn, fn);
-  return txLock;
-}
+// ---- Main exported function ----
+async function preserveOnBaseIfTagged(order) {
+  try {
+    const orderLabel = order?.name || `#${order?.id || "unknown"}`;
 
-async function writeToBase(record) {
-  return runWithTxLock(async () => {
-    const toEnv = (process.env.PRESERVED_RECORD_TO || "").trim();
-    const to = toEnv ? toEnv : signer.address;
-
-    const data = toCalldata(record);
-
-    const bytes = (data.length - 2) / 2;
-    if (bytes > 1400) throw new Error(`Preserved record too large (${bytes} bytes)`);
-
-    // ✅ Nonce source of truth:
-    // Use "latest" mined nonce to avoid `nonce has already been used` errors
-    // that can happen with "pending" across different RPC mempools.
-    const nonce = await provider.getTransactionCount(signer.address, "latest");
-
-    // Fee data (EIP-1559)
-    const feeData = await provider.getFeeData();
-
-    // If provider returns nulls, use sane fallbacks.
-    // Slightly higher fallbacks help Base tx inclusion.
-    const baseMaxPriority =
-      feeData.maxPriorityFeePerGas ?? ethers.parseUnits("0.002", "gwei");
-    const baseMaxFee =
-      feeData.maxFeePerGas ?? ethers.parseUnits("0.08", "gwei");
-
-    // Aggressive bump to reduce replacement/underpriced issues
-    const maxPriorityFeePerGas = (baseMaxPriority * 180n) / 100n; // +80%
-    const maxFeePerGas = (baseMaxFee * 180n) / 100n;             // +80%
-
-    // Estimate gas + buffer
-    const estimated = await provider.estimateGas({
-      from: signer.address,
-      to,
-      data,
-      value: 0n
-    });
-    const gasLimit = (estimated * 130n) / 100n; // +30%
-
-    // Send transaction
-    const tx = await signer.sendTransaction({
-      to,
-      value: 0n,
-      data,
-      nonce,
-      gasLimit,
-      maxFeePerGas,
-      maxPriorityFeePerGas
-    });
-
-    // Wait for confirmations (finality)
-    const receipt = await withTimeout(
-      tx.wait(CONFIRMATIONS),
-      WAIT_TIMEOUT_MS,
-      "tx confirmation"
-    );
-
-    if (!receipt || receipt.status !== 1) {
-      throw new Error("Preserve transaction failed or was reverted");
+    if (PRESERVE_DISABLED) {
+      console.log("ℹ️ Preserve disabled by PRESERVE_DISABLED=true:", orderLabel);
+      return { preserved: false, skipped: true, reason: "disabled" };
     }
 
-    return receipt.transactionHash;
-  });
-}
+    // Redundant safety: server.js already checks, but keep this too.
+    if (!preserveRequested(order)) {
+      return { preserved: false, skipped: true, reason: "not_requested" };
+    }
 
-async function preserveOnBaseIfTagged(order) {
-  if (!shouldPreserve(order)) return { preserved: false };
+    if (!order?.id) {
+      return { preserved: false, skipped: true, reason: "missing_order_id" };
+    }
 
-  const processed = loadProcessed();
-  const key = String(order?.id || "");
+    // Delay to avoid nonce fights when burn tx was just sent.
+    if (PRESERVE_DELAY_MS > 0) {
+      console.log(`⏳ Preserve delay ${PRESERVE_DELAY_MS}ms…`, orderLabel);
+      await sleep(PRESERVE_DELAY_MS);
+    }
 
-  // If we already finalized this order, skip (prevents double-preserve on retries)
-  if (key && processed.has(key)) {
-    return { preserved: true, skipped: true };
+    const { digestHex, dataHex, canonicalSize } = buildProofCalldata(order);
+
+    // Self-tx: no funds moved, only calldata written to chain history
+    const to = await wallet.getAddress();
+
+    // Nonce fix requested: use pending nonce
+    const nonce = await wallet.getNonce("pending");
+
+    const feeOverrides = await getFeeOverrides();
+
+    const txRequest = {
+      to,
+      value: 0n,
+      data: dataHex,
+      nonce,
+      // keep a reasonable cap; calldata is tiny so gas is low
+      gasLimit: 120000n,
+      ...feeOverrides,
+    };
+
+    console.log("🧬 Preserve payload:", {
+      order: orderLabel,
+      digest: digestHex,
+      bytes: (dataHex.length - 2) / 2,
+      canonicalSize,
+      nonce,
+    });
+
+    const tx = await wallet.sendTransaction(txRequest);
+    console.log("🧬 Preserve TX (broadcast):", tx.hash);
+
+    const receipt = await tx.wait(1);
+    if (!receipt || receipt.status !== 1) {
+      console.log("⚠️ Preserve tx failed or reverted:", orderLabel);
+      return { preserved: false, skipped: false, reason: "reverted" };
+    }
+
+    console.log("🧬 Preserve TX (confirmed):", receipt.transactionHash);
+    return {
+      preserved: true,
+      txHash: receipt.transactionHash,
+      digest: digestHex,
+    };
+  } catch (e) {
+    // Ethers common replacement behavior:
+    // code: 'TRANSACTION_REPLACED', e.replacement, e.cancelled
+    if (e?.code === "TRANSACTION_REPLACED") {
+      const cancelled = !!e.cancelled;
+      const replacementHash = e?.replacement?.hash;
+
+      if (!cancelled && replacementHash) {
+        console.log("🧬 Preserve tx replaced by:", replacementHash);
+        return { preserved: true, txHash: replacementHash, replaced: true };
+      }
+
+      console.error(
+        "❌ Preserve failed: transaction was replaced/cancelled:",
+        e?.message || e
+      );
+      return {
+        preserved: false,
+        skipped: false,
+        reason: "replaced_cancelled",
+        error: e?.message || String(e),
+      };
+    }
+
+    console.error("❌ Preserve failed:", e?.message || e);
+    return {
+      preserved: false,
+      skipped: false,
+      reason: "error",
+      error: e?.message || String(e),
+    };
   }
-
-  const record = buildRecord(order);
-
-  // Only store as processed AFTER we have a CONFIRMED tx hash
-  const txHash = await writeToBase(record);
-
-  if (key) {
-    processed.add(key);
-    saveProcessed(processed);
-  }
-
-  return { preserved: true, txHash, record };
 }
 
 module.exports = { preserveOnBaseIfTagged };
-
-
