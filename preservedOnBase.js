@@ -144,7 +144,7 @@ async function writeToBase(record) {
     // ✅ Nonce source of truth:
     // Use "latest" mined nonce to avoid `nonce has already been used` errors
     // that can happen with "pending" across different RPC mempools.
-    const nonce = await provider.getTransactionCount(signer.address, "latest");
+    const nonce = await signer.getNonce("pending");
 
     // Fee data (EIP-1559)
     const feeData = await provider.getFeeData();
