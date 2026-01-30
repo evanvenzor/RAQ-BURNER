@@ -162,17 +162,20 @@ async function preserveOnBaseIfTagged(order) {
     console.log("🧬 Preserve TX (broadcast):", tx.hash);
 
     const receipt = await tx.wait(1);
-    if (!receipt || receipt.status !== 1) {
-      console.log("⚠️ Preserve tx failed or reverted:", orderLabel);
-      return { preserved: false, skipped: false, reason: "reverted" };
-    }
 
-    console.log("🧬 Preserve TX (confirmed):", receipt.transactionHash);
-    return {
-      preserved: true,
-      txHash: receipt.transactionHash,
-      digest: digestHex,
-    };
+if (!receipt || receipt.status !== 1) {
+  console.log("⚠️ Preserve tx failed or reverted:", orderLabel);
+  return { preserved: false, skipped: false, reason: "reverted" };
+}
+
+console.log("🚀 Preserve TX (confirmed):", receipt.hash);
+
+return {
+  preserved: true,
+  txHash: receipt.hash,
+  digest: digestHex,
+};
+
   } catch (e) {
     // Ethers common replacement behavior:
     // code: 'TRANSACTION_REPLACED', e.replacement, e.cancelled
