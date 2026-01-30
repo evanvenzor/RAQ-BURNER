@@ -1,6 +1,12 @@
 // server.js
 // RAQ Automated Burn Webhook Server for Shopify Orders
 // + Preserved on Base™ (title-token trigger)
+// Corrections included:
+// ✅ Burn tx waits for 1 confirmation BEFORE preserve (prevents "tx replaced" nonce fights)
+// ✅ Preserve runs even if burn is skipped (non-USD / subtotal / low balance)
+// ✅ Safe logging (proper template strings)
+// ✅ In-flight guard for preserve per order id
+// ✅ HMAC verification on RAW body (Shopify-compatible)
 
 const express = require("express");
 const crypto = require("crypto");
@@ -56,7 +62,7 @@ function verifyHmacFromRaw(rawBody, hmacHeader) {
 // === Detect preserve request by token in any line item title ===
 function isPreserveRequestedByTitleToken(order) {
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
-  return items.some(li => String(li?.title || "").includes(PRESERVE_TOKEN));
+  return items.some((li) => String(li?.title || "").includes(PRESERVE_TOKEN));
 }
 
 // === Blockchain Wallet ===
@@ -105,14 +111,14 @@ app.post(
       const orderLabel = order?.name || `#${order.id}`;
 
       // ====================================================
-      // 🔥 RAQ BURN — RUNS IMMEDIATELY (UNCHANGED)
+      // 🔥 RAQ BURN — CONFIRM BEFORE PRESERVE
       // ====================================================
       const subtotal = parseFloat(order.subtotal_price || "0");
       const currency = (order.currency || "").toUpperCase().trim();
 
       console.log(`Order ${orderLabel} → $${subtotal} ${currency}`);
 
-      // Burn is conditional, but we DO NOT return early anymore.
+      // We do NOT return early. Burn may skip; preserve can still run.
       if (Number.isFinite(subtotal) && subtotal > 0 && currency === "USD") {
         const burnAmount = subtotal * RAQ_PER_DOLLAR;
         const burnAmountWei = ethers.parseUnits(
@@ -130,8 +136,19 @@ app.post(
         );
 
         if (bal >= burnAmountWei) {
-          const tx = await raq.transfer(BURN_ADDRESS, burnAmountWei);
-          console.log(`✔ Burn TX: ${tx.hash}`);
+          try {
+            const tx = await raq.transfer(BURN_ADDRESS, burnAmountWei);
+            console.log(`✔ Burn TX (broadcast): ${tx.hash}`);
+
+            const receipt = await tx.wait(1); // wait for 1 confirmation
+            if (!receipt || receipt.status !== 1) {
+              console.log("⚠️ Burn tx failed or was reverted");
+            } else {
+              console.log(`✔ Burn TX (confirmed): ${receipt.transactionHash}`);
+            }
+          } catch (e) {
+            console.error("❌ Burn tx failed:", e?.message || e);
+          }
         } else {
           console.log("Skipping burn: insufficient RAQ balance");
         }
@@ -143,6 +160,8 @@ app.post(
       // 🧬 PRESERVED ON BASE™ — TITLE TOKEN TRIGGER
       // ====================================================
       (async () => {
+        const idKey = String(order.id);
+
         try {
           const requested = isPreserveRequestedByTitleToken(order);
 
@@ -151,19 +170,23 @@ app.post(
             return;
           }
 
-          if (inflightPreserve.has(String(order.id))) {
+          if (inflightPreserve.has(idKey)) {
             console.log("ℹ️ Preserve already in-flight:", orderLabel);
             return;
           }
 
-          inflightPreserve.add(String(order.id));
+          inflightPreserve.add(idKey);
           console.log("🧬 Preserve requested (token found):", orderLabel);
 
-          // NOTE: This assumes preservedOnBase.js also supports the token trigger.
           const result = await preserveOnBaseIfTagged(order);
 
           if (result?.preserved && result?.txHash) {
-            console.log("🧬 Preserved on Base™ tx:", result.txHash, "order:", orderLabel);
+            console.log(
+              "🧬 Preserved on Base™ tx:",
+              result.txHash,
+              "order:",
+              orderLabel
+            );
           } else if (result?.preserved && result?.skipped) {
             console.log("ℹ️ Preserved on Base™ skipped:", orderLabel);
           } else {
@@ -172,11 +195,25 @@ app.post(
         } catch (e) {
           console.error("❌ Preserved on Base™ failed:", e?.message || e);
         } finally {
-          inflightPreserve.delete(String(order.id));
+          inflightPreserve.delete(idKey);
         }
       })();
 
       return res.status(200).send("ok");
+    } catch (err) {
+      console.error("Webhook Error:", err?.message || err);
+      return res.status(500).send("Error");
+    }
+  }
+);
+
+// === Health check ===
+app.get("/", (req, res) => res.status(200).send("ok"));
+
+// === Start Server ===
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`RAQ Burner Live @ PORT ${PORT}`));
+
     } catch (err) {
       console.error("Webhook Error:", err?.message || err);
       return res.status(500).send("Error");
