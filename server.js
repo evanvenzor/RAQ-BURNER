@@ -1,8 +1,9 @@
 // server.js
 // RAQ Automated Burn Webhook Server for Shopify Orders
 // + Preserved on Base™ (title-token trigger)
+//
 // Corrections included:
-// ✅ Burn tx waits for 1 confirmation BEFORE preserve (prevents "tx replaced" nonce fights)
+// ✅ Burn tx waits for 1 confirmation BEFORE preserve (reduces nonce fights)
 // ✅ Preserve runs even if burn is skipped (non-USD / subtotal / low balance)
 // ✅ Safe logging (proper template strings)
 // ✅ In-flight guard for preserve per order id
@@ -16,6 +17,9 @@ const { preserveOnBaseIfTagged } = require("./preservedOnBase");
 const app = express();
 app.set("trust proxy", true);
 
+// ------------------------------------------------------------
+// Logging middleware
+// ------------------------------------------------------------
 app.use((req, res, next) => {
   console.log(
     `[INCOMING ${new Date().toISOString()}] ${req.ip} ${req.method} ${req.originalUrl}`
@@ -23,7 +27,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// === CONFIG (Render env vars) ===
+// ------------------------------------------------------------
+// CONFIG (Render env vars)
+// ------------------------------------------------------------
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 const TREASURY_PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
 
@@ -31,19 +37,23 @@ if (!TREASURY_PRIVATE_KEY) {
   throw new Error("Missing TREASURY_PRIVATE_KEY env var");
 }
 
-// === RAQ Token Settings ===
+// ------------------------------------------------------------
+// RAQ Token Settings
+// ------------------------------------------------------------
 const BASE_RPC_URL = process.env.BASE_RPC_URL || "https://mainnet.base.org";
 const RAQ_TOKEN_ADDRESS = "0x80ab779f3071a9c6af4f0a5737e1f6aaa4da72eb";
 const BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD";
 const TOKEN_DECIMALS = 18;
 
-// === Burn Formula ===
+// Burn formula
 const RAQ_PER_DOLLAR = 10;
 
-// === PRESERVED ON BASE™ Title Token ===
+// Preserved on Base™ title token marker
 const PRESERVE_TOKEN = "⟡ Preserved_on_Base ⟡";
 
-// === Verify Shopify Webhook HMAC ===
+// ------------------------------------------------------------
+// Verify Shopify Webhook HMAC (RAW body)
+// ------------------------------------------------------------
 function verifyHmacFromRaw(rawBody, hmacHeader) {
   if (!SHOPIFY_WEBHOOK_SECRET || !hmacHeader) return false;
 
@@ -59,13 +69,15 @@ function verifyHmacFromRaw(rawBody, hmacHeader) {
   }
 }
 
-// === Detect preserve request by token in any line item title ===
+// Detect preserve request by token in any line item title
 function isPreserveRequestedByTitleToken(order) {
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
   return items.some((li) => String(li?.title || "").includes(PRESERVE_TOKEN));
 }
 
-// === Blockchain Wallet ===
+// ------------------------------------------------------------
+// Blockchain Wallet
+// ------------------------------------------------------------
 const provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
 const wallet = new ethers.Wallet(TREASURY_PRIVATE_KEY, provider);
 
@@ -73,7 +85,7 @@ const raq = new ethers.Contract(
   RAQ_TOKEN_ADDRESS,
   [
     "function transfer(address to, uint256 amount) public returns (bool)",
-    "function balanceOf(address owner) view returns (uint256)"
+    "function balanceOf(address owner) view returns (uint256)",
   ],
   wallet
 );
@@ -109,16 +121,19 @@ app.post(
       }
 
       const orderLabel = order?.name || `#${order.id}`;
+      const idKey = String(order.id);
 
-      // ====================================================
-      // 🔥 RAQ BURN — CONFIRM BEFORE PRESERVE
-      // ====================================================
+      console.log(`Order ${orderLabel} received`);
+
+      // --------------------------------------------------------
+      // 🔥 RAQ BURN — confirm 1 block BEFORE preserve
+      // (This reduces nonce collisions with preserve txs)
+      // --------------------------------------------------------
       const subtotal = parseFloat(order.subtotal_price || "0");
       const currency = (order.currency || "").toUpperCase().trim();
 
       console.log(`Order ${orderLabel} → $${subtotal} ${currency}`);
 
-      // We do NOT return early. Burn may skip; preserve can still run.
       if (Number.isFinite(subtotal) && subtotal > 0 && currency === "USD") {
         const burnAmount = subtotal * RAQ_PER_DOLLAR;
         const burnAmountWei = ethers.parseUnits(
@@ -128,40 +143,39 @@ app.post(
 
         console.log(`🔥 Burning ${burnAmount} RAQ...`);
 
-        const treasury = await wallet.getAddress();
-        const bal = await raq.balanceOf(treasury);
+        try {
+          const treasury = await wallet.getAddress();
+          const bal = await raq.balanceOf(treasury);
 
-        console.log(
-          `Treasury RAQ balance: ${ethers.formatUnits(bal, TOKEN_DECIMALS)} RAQ`
-        );
+          console.log(
+            `Treasury RAQ balance: ${ethers.formatUnits(bal, TOKEN_DECIMALS)} RAQ`
+          );
 
-        if (bal >= burnAmountWei) {
-          try {
+          if (bal >= burnAmountWei) {
             const tx = await raq.transfer(BURN_ADDRESS, burnAmountWei);
             console.log(`✔ Burn TX (broadcast): ${tx.hash}`);
 
-            const receipt = await tx.wait(1); // wait for 1 confirmation
+            const receipt = await tx.wait(1);
             if (!receipt || receipt.status !== 1) {
               console.log("⚠️ Burn tx failed or was reverted");
             } else {
               console.log(`✔ Burn TX (confirmed): ${receipt.transactionHash}`);
             }
-          } catch (e) {
-            console.error("❌ Burn tx failed:", e?.message || e);
+          } else {
+            console.log("Skipping burn: insufficient RAQ balance");
           }
-        } else {
-          console.log("Skipping burn: insufficient RAQ balance");
+        } catch (e) {
+          console.error("❌ Burn tx failed:", e?.message || e);
         }
       } else {
         console.log("Skipping burn: invalid subtotal or non-USD currency");
       }
 
-      // ====================================================
-      // 🧬 PRESERVED ON BASE™ — TITLE TOKEN TRIGGER
-      // ====================================================
+      // --------------------------------------------------------
+      // 🧬 PRESERVED ON BASE™ — title token trigger
+      // Runs even if burn is skipped
+      // --------------------------------------------------------
       (async () => {
-        const idKey = String(order.id);
-
         try {
           const requested = isPreserveRequestedByTitleToken(order);
 
@@ -181,12 +195,7 @@ app.post(
           const result = await preserveOnBaseIfTagged(order);
 
           if (result?.preserved && result?.txHash) {
-            console.log(
-              "🧬 Preserved on Base™ tx:",
-              result.txHash,
-              "order:",
-              orderLabel
-            );
+            console.log("🧬 Preserved on Base™ tx:", result.txHash, "order:", orderLabel);
           } else if (result?.preserved && result?.skipped) {
             console.log("ℹ️ Preserved on Base™ skipped:", orderLabel);
           } else {
@@ -207,24 +216,15 @@ app.post(
   }
 );
 
-// === Health check ===
+// ============================================================
+// Health check (ONE copy)
+// ============================================================
 app.get("/", (req, res) => res.status(200).send("ok"));
 
-// === Start Server ===
+// ============================================================
+// Start server (ONE copy)
+// ============================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`RAQ Burner Live @ PORT ${PORT}`));
 
-    } catch (err) {
-      console.error("Webhook Error:", err?.message || err);
-      return res.status(500).send("Error");
-    }
-  }
-);
-
-// === Health check ===
-app.get("/", (req, res) => res.status(200).send("ok"));
-
-// === Start Server ===
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`RAQ Burner Live @ PORT ${PORT}`));
 
