@@ -1,10 +1,13 @@
 // preservedOnBase.js
 // Preserved on Base™ — title-token trigger + CONFIRMED finality (waits for block confirmation)
-// Fixes:
-// - Waits for onchain confirmation (tx.wait(1)) so you only log/store REAL finalized txs
-// - Uses pending nonce + explicit EIP-1559 fees + gas estimate buffer
-// - Uses /tmp for runtime dedupe on Render
-// - Removes duplicate module.exports
+//
+// Corrections included (for your nonce-used error + stability):
+// ✅ Uses CHAIN-TRUTH nonce ("latest") instead of "pending" to avoid `nonce has already been used`
+// ✅ Adds a simple in-process TX LOCK so two preserves can't race the nonce
+// ✅ Waits for confirmations (tx.wait) and only returns a FINALIZED tx hash
+// ✅ Keeps EIP-1559 fees + bump + gas estimate buffer
+// ✅ Uses /tmp for runtime dedupe on Render
+// ✅ Single module.exports
 
 const fs = require("fs");
 const path = require("path");
@@ -24,7 +27,7 @@ const STORE_PATH = path.join("/tmp", "pob-processed-orders.json");
 // Your “Where’s Waldo” marker token in product titles
 const PRESERVE_TOKEN = "⟡ Preserved_on_Base ⟡";
 
-// How many confirmations before we call it "final" (1 is fine for Base UX)
+// How many confirmations before we call it "final"
 const CONFIRMATIONS = Number(process.env.POB_CONFIRMATIONS || "1");
 
 // Optional: max time to wait for confirmation before failing (ms)
@@ -118,64 +121,78 @@ function withTimeout(promise, ms, label = "operation") {
   ]);
 }
 
+// ----------------------------------------------------------------------------
+// TX LOCK: ensures only one preservation tx is constructed/sent at a time.
+// This prevents nonce races when webhooks retry or two requests overlap.
+// ----------------------------------------------------------------------------
+let txLock = Promise.resolve();
+function runWithTxLock(fn) {
+  txLock = txLock.then(fn, fn);
+  return txLock;
+}
+
 async function writeToBase(record) {
-  const toEnv = (process.env.PRESERVED_RECORD_TO || "").trim();
-  const to = toEnv ? toEnv : signer.address;
+  return runWithTxLock(async () => {
+    const toEnv = (process.env.PRESERVED_RECORD_TO || "").trim();
+    const to = toEnv ? toEnv : signer.address;
 
-  const data = toCalldata(record);
+    const data = toCalldata(record);
 
-  const bytes = (data.length - 2) / 2;
-  if (bytes > 1400) throw new Error(`Preserved record too large (${bytes} bytes)`);
+    const bytes = (data.length - 2) / 2;
+    if (bytes > 1400) throw new Error(`Preserved record too large (${bytes} bytes)`);
 
-  // 1) Use pending nonce (avoids collisions with unmined txs)
-  const nonce = await signer.getNonce("pending");
+    // ✅ Nonce source of truth:
+    // Use "latest" mined nonce to avoid `nonce has already been used` errors
+    // that can happen with "pending" across different RPC mempools.
+    const nonce = await provider.getTransactionCount(signer.address, "latest");
 
-  // 2) Explicit EIP-1559 fees + bump (helps avoid replacement-underpriced)
-  const feeData = await provider.getFeeData();
+    // Fee data (EIP-1559)
+    const feeData = await provider.getFeeData();
 
-  // If provider returns nulls, use sane fallbacks
-  const baseMaxPriority =
-    feeData.maxPriorityFeePerGas ?? ethers.parseUnits("0.001", "gwei");
-  const baseMaxFee =
-    feeData.maxFeePerGas ?? ethers.parseUnits("0.05", "gwei");
+    // If provider returns nulls, use sane fallbacks.
+    // Slightly higher fallbacks help Base tx inclusion.
+    const baseMaxPriority =
+      feeData.maxPriorityFeePerGas ?? ethers.parseUnits("0.002", "gwei");
+    const baseMaxFee =
+      feeData.maxFeePerGas ?? ethers.parseUnits("0.08", "gwei");
 
-  // +60% bump (more aggressive than +30% to avoid stubborn mempool replacements)
-  const maxPriorityFeePerGas = (baseMaxPriority * 160n) / 100n;
-  const maxFeePerGas = (baseMaxFee * 160n) / 100n;
+    // Aggressive bump to reduce replacement/underpriced issues
+    const maxPriorityFeePerGas = (baseMaxPriority * 180n) / 100n; // +80%
+    const maxFeePerGas = (baseMaxFee * 180n) / 100n;             // +80%
 
-  // 3) Estimate gas + buffer
-  const estimated = await provider.estimateGas({
-    from: signer.address,
-    to,
-    data,
-    value: 0n
+    // Estimate gas + buffer
+    const estimated = await provider.estimateGas({
+      from: signer.address,
+      to,
+      data,
+      value: 0n
+    });
+    const gasLimit = (estimated * 130n) / 100n; // +30%
+
+    // Send transaction
+    const tx = await signer.sendTransaction({
+      to,
+      value: 0n,
+      data,
+      nonce,
+      gasLimit,
+      maxFeePerGas,
+      maxPriorityFeePerGas
+    });
+
+    // Wait for confirmations (finality)
+    const receipt = await withTimeout(
+      tx.wait(CONFIRMATIONS),
+      WAIT_TIMEOUT_MS,
+      "tx confirmation"
+    );
+
+    if (!receipt || receipt.status !== 1) {
+      throw new Error("Preserve transaction failed or was reverted");
+    }
+
+    return receipt.transactionHash;
   });
-  const gasLimit = (estimated * 120n) / 100n; // +20%
-
-  // 4) Send transaction
-  const tx = await signer.sendTransaction({
-    to,
-    value: 0n,
-    data,
-    nonce,
-    gasLimit,
-    maxFeePerGas,
-    maxPriorityFeePerGas
-  });
-
-  // 5) WAIT FOR CONFIRMATION (this is what makes it "real" on BaseScan)
-  const receipt = await withTimeout(
-    tx.wait(CONFIRMATIONS),
-    WAIT_TIMEOUT_MS,
-    "tx confirmation"
-  );
-
-  if (!receipt || receipt.status !== 1) {
-    throw new Error("Preserve transaction failed or was reverted");
-  }
-
-  // Return the confirmed tx hash (not just broadcast hash)
-  return receipt.transactionHash;
 }
 
 async function preserveOnBaseIfTagged(order) {
