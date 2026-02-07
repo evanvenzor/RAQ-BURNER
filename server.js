@@ -150,7 +150,7 @@ app.post(
             if (!receipt || receipt.status !== 1) {
               console.log("⚠️ Burn tx failed or reverted");
             } else {
-              console.log(`✔ Burn TX (confirmed): ${receipt.transactionHash}`);
+              console.log(`✔ Burn TX (confirmed): ${receipt?.transactionHash || tx?.hash}`);
             }
           } catch (e) {
             console.error("❌ Burn tx failed:", e?.message || e);
