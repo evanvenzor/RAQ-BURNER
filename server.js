@@ -109,6 +109,8 @@ app.post(
       } catch {
         order = {};
       }
+      
+    console.log("🧾 Order note_attributes:", order?.note_attributes);
 
       if (!order?.id) {
         console.log("Skipping: missing order.id");
