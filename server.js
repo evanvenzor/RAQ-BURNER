@@ -18,6 +18,31 @@ function getNoteAttr(order, key) {
   return attrs.find(a => String(a?.name || "") === key)?.value;
 }
 
+// ---- Preservations feed (ephemeral, newest-first) ----
+const PRESERVE_PREFIX_HEX = "0x504f4231"; // "POB1" in hex
+const inMemoryPreservations = []; // newest first
+const MAX_INMEM = 100;
+
+function pushPreservation(item) {
+  // item: { txHash, created_at, order, intent_id, viewUrl }
+  inMemoryPreservations.unshift(item);
+  // de-dupe by txHash
+  const seen = new Set();
+  for (let i = 0; i < inMemoryPreservations.length; i++) {
+    const h = inMemoryPreservations[i]?.txHash;
+    if (!h) continue;
+    if (seen.has(h)) {
+      inMemoryPreservations.splice(i, 1);
+      i--;
+    } else {
+      seen.add(h);
+    }
+  }
+  if (inMemoryPreservations.length > MAX_INMEM) {
+    inMemoryPreservations.length = MAX_INMEM;
+  }
+}
+
 // ============================================================
 // CONFIG (Render env vars)
 // ============================================================
