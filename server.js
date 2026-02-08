@@ -232,6 +232,17 @@ if (result?.preserved && result?.txHash && intentId !== "none") {
     storePath: preserveStore.STORE_PATH,
   });
 }
+    if (result?.preserved && result?.txHash) {
+  pushPreservation({
+    txHash: result.txHash,
+    created_at: order?.created_at || new Date().toISOString(),
+    order: order?.name || `#${order?.id || "unknown"}`,
+    intent_id: getNoteAttr(order, "preserved_intent_id") || "none",
+    viewUrl: `https://basescan.org/tx/${result.txHash}`,
+  });
+
+  console.log("📌 Added to in-memory Preservations feed:", result.txHash);
+}      
 
           if (result?.preserved && result?.txHash) {
             console.log("🧬 Preserved on Base™ tx:", result.txHash, "order:", orderLabel);
@@ -259,6 +270,20 @@ if (result?.preserved && result?.txHash && intentId !== "none") {
 // HEALTH CHECK (ONE copy only)
 // ============================================================
 app.get("/", (req, res) => res.status(200).send("ok"));
+app.get("/preservations", (req, res) => {
+  // newest-first list (ephemeral, resets if Render restarts)
+  return res.json({
+    newest_first: true,
+    count: inMemoryPreservations.length,
+    items: inMemoryPreservations.map((x) => ({
+      txHash: x.txHash,
+      created_at: x.created_at,
+      order: x.order,
+      intent_id: x.intent_id,
+      viewUrl: x.viewUrl,
+    })),
+  });
+});
 
 // ============================================================
 // START SERVER (ONE copy only)
