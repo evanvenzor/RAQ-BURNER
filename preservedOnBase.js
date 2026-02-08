@@ -53,12 +53,24 @@ function buildCanonicalRecord(order) {
   const emailHash = customerEmail
     ? ethers.keccak256(ethers.toUtf8Bytes(customerEmail.trim().toLowerCase()))
     : null;
+  
+  // ---- Preserve intent bridge (Shopify cart → order.note_attributes) ----
+  const noteAttributes = Array.isArray(order?.note_attributes)
+    ? order.note_attributes
+    : [];
+
+  const intentId =
+    noteAttributes.find((a) => String(a?.name || "") === "preserved_intent_id")
+  ?.value ?? "none";
 
   return {
     v: 1,
     type: "PRESERVED_ON_BASE",
     order_id: String(order?.id || ""),
     order_name: String(order?.name || ""),
+    
+    preserved_intent_id: String(intentId || "none"),
+    
     created_at: String(order?.created_at || ""),
     currency: String(order?.currency || ""),
     subtotal: String(order?.subtotal_price || ""),
