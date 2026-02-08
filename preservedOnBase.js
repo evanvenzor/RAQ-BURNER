@@ -86,6 +86,10 @@ function buildCanonicalRecord(order) {
  */
 function buildProofCalldata(order) {
   const record = buildCanonicalRecord(order);
+  console.log(
+  "🧬 preserved_intent_id in canonical record:",
+  record.preserved_intent_id
+);
   const canonical = JSON.stringify(record);
   const digestHex = ethers.keccak256(ethers.toUtf8Bytes(canonical)); // 0x + 32 bytes
 
