@@ -6,9 +6,17 @@ const express = require("express");
 const crypto = require("crypto");
 const { ethers } = require("ethers");
 const { preserveOnBaseIfTagged } = require("./preservedOnBase");
+const preserveStore = require("./preserveStore");
 
 const app = express();
 app.set("trust proxy", true);
+function getNoteAttr(order, key) {
+  const attrs = Array.isArray(order?.note_attributes)
+    ? order.note_attributes
+    : [];
+
+  return attrs.find(a => String(a?.name || "") === key)?.value;
+}
 
 // ============================================================
 // CONFIG (Render env vars)
