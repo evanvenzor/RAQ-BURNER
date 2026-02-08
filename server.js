@@ -191,6 +191,22 @@ app.post(
           console.log("🧬 Preserve requested (token found):", orderLabel);
 
           const result = await preserveOnBaseIfTagged(order);
+          const intentId = getNoteAttr(order, "preserved_intent_id") || "none";
+
+if (result?.preserved && result?.txHash && intentId !== "none") {
+  preserveStore.put(intentId, {
+    txHash: result.txHash,
+    digest: result.digest || null,
+    order: order?.name || `#${order?.id || "unknown"}`,
+    created_at: order?.created_at || new Date().toISOString(),
+  });
+
+  console.log("🔎 Stored preserve lookup:", {
+    intent_id: intentId,
+    txHash: result.txHash,
+    storePath: preserveStore.STORE_PATH,
+  });
+}
 
           if (result?.preserved && result?.txHash) {
             console.log("🧬 Preserved on Base™ tx:", result.txHash, "order:", orderLabel);
