@@ -240,4 +240,26 @@ app.get("/", (req, res) => res.status(200).send("ok"));
 // Render provides PORT
 // ============================================================
 const PORT = Number(process.env.PORT || 3000);
+app.get("/preserve/:intentId", (req, res) => {
+  const intentId = String(req.params.intentId || "").trim();
+  const row = preserveStore.get(intentId);
+
+  if (!row) {
+    return res.status(404).json({
+      found: false,
+      intent_id: intentId,
+    });
+  }
+
+  return res.json({
+    found: true,
+    intent_id: intentId,
+    txHash: row.txHash,
+    digest: row.digest,
+    order: row.order,
+    created_at: row.created_at,
+    viewUrl: `https://basescan.org/tx/${row.txHash}`,
+  });
+});
+
 app.listen(PORT, "0.0.0.0", () => console.log(`RAQ Burner Live @ PORT ${PORT}`));
