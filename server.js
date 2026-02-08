@@ -271,11 +271,16 @@ if (result?.preserved && result?.txHash && intentId !== "none") {
 // ============================================================
 app.get("/", (req, res) => res.status(200).send("ok"));
 app.get("/preservations", (req, res) => {
+  // 🔓 Allow storefront JS to read this endpoint
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
   // newest-first list (ephemeral, resets if Render restarts)
   return res.json({
     newest_first: true,
     count: inMemoryPreservations.length,
-    items: inMemoryPreservations.map((x) => ({
+    items: inMemoryPreservations.map(x => ({
       txHash: x.txHash,
       created_at: x.created_at,
       order: x.order,
@@ -283,6 +288,12 @@ app.get("/preservations", (req, res) => {
       viewUrl: x.viewUrl,
     })),
   });
+});
+app.options("/preservations", (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  return res.sendStatus(204);
 });
 
 // ============================================================
